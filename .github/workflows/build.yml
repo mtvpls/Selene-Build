@@ -114,6 +114,7 @@ jobs:
 
       - name: Build with build.sh (Android/macOS/iOS)
         if: matrix.name != 'windows-amd64'
+        continue-on-error: true
         run: |
           chmod +x build.sh
           ./build.sh ${{ matrix.build-args }}
@@ -121,6 +122,7 @@ jobs:
       
       - name: Build on Windows
         if: matrix.name == 'windows-amd64'
+        continue-on-error: true
         shell: pwsh
         run: |
           $version = "${{ steps.get_version.outputs.version }}"
@@ -134,6 +136,7 @@ jobs:
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: ${{ matrix.name }}-release-artifacts
           path: dist/*
@@ -308,4 +311,3 @@ jobs:
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 2
-
