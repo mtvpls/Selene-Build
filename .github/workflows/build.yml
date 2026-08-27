@@ -27,12 +27,12 @@ jobs:
           # macOS / iOS
           - name: macos_ios
             os: macos-latest
-            build-args: "--apple-only"
+            build-args: "--apple-only --sequential"
             
           # Windows
           - name: windows-amd64
             os: windows-latest
-    
+
     runs-on: ${{ matrix.os }}
     env:
       NDK_VERSION: '29.0.14033849'
@@ -40,7 +40,7 @@ jobs:
     name: Build ${{ matrix.name }}
     outputs:
       version: ${{ steps.get_version.outputs.version }}
-    
+
     steps:
       - name: Clone repository
         run: |
@@ -81,22 +81,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            android/.gradle
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Cache NDK
-        if: matrix.name == 'android'
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: |
             ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
             ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION_DEPS }}
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}-${{ env.NDK_VERSION_DEPS }}
+          restore-keys: |
+            ${{ runner.os }}-ndk-
 
       - name: Install NDK
         if: matrix.name == 'android' && steps.cache-ndk.outputs.cache-hit != 'true'
@@ -277,7 +266,7 @@ jobs:
           if release_notes:
               if len(release_notes) > 800:
                   release_notes = release_notes[:800] + "..."
-              message += f"\n\n📝 *更新说明*:\n{release_notes}"
+              message += f"\n\n📝 *更新说明*: \n{release_notes}"
           
           message += f"""
           
