@@ -43,9 +43,11 @@ jobs:
 
     steps:
       - name: Clone repository
-        run: |
-          git clone https://${{ secrets.PULL_TOKEN }}@${{ secrets.REPO_URL }}.git .
-        shell: bash
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.REPO_URL }}
+          token: ${{ secrets.PULL_TOKEN }}
+          fetch-depth: 1
       
       - name: Get version from pubspec.yaml
         id: get_version
