@@ -29,18 +29,9 @@ jobs:
             os: macos-latest
             build-args: "--apple-only --sequential"
 
-          # Windows x64
+          # Windows
           - name: windows-amd64
             os: windows-latest
-            arch: x64
-
-          # Windows ARM64 - must run on a native ARM runner.
-          # Flutter has no Windows cross-compilation: in 3.38.7
-          # `flutter build windows` targets the host architecture only
-          # (windows-x64 on an x64 host, windows-arm64 on an ARM64 host).
-          - name: windows-arm64
-            os: windows-11-arm
-            arch: arm64
 
     runs-on: ${{ matrix.os }}
     env:
@@ -71,42 +62,7 @@ jobs:
           echo "Extracted version: $VERSION"
         shell: bash
 
-      # Windows ARM64 only: this job CANNOT stay on Flutter 3.38.7.
-      # Verified 2026-11-19 against storage.googleapis.com/flutter_infra_release:
-      # for 3.38.7's engine (78fc3012e4), dart-sdk-windows-arm64.zip = 404 and
-      # windows-arm64/artifacts.zip = 404 - that release simply has no Windows
-      # ARM64 Dart SDK or engine. Its update_dart_sdk.ps1 then falls back to
-      # the x64 Dart ("does not support Windows Arm64, falling back to x64"),
-      # Abi.current() reports windows_x64, and `flutter build windows`
-      # silently builds build/windows/x64/ even on an ARM64 runner.
-      # The first stable line shipping native Windows ARM64 Dart + engine is
-      # 3.44; 3.44.9 (2026-08-06, Dart 3.12.2) returns 200 for both files.
-      # So: every other job stays pinned to 3.38.7, ONLY this job uses
-      # 3.44.9 - the same split RustDesk uses (x64 on the old version,
-      # Windows ARM64 on 3.44.9). Also do NOT use subosito/flutter-action
-      # here: its Windows SDK archive is x64-only even for 3.44.9, whereas
-      # a git clone bootstraps the native ARM64 Dart on first run.
-      # This is inlined because the checkout above replaces the workspace
-      # with the Selene repo (secrets.REPO_URL), so a script file committed
-      # to the workflow repo would not be present here.
-      - name: Install Flutter 3.44.9 (Windows ARM64)
-        if: matrix.name == 'windows-arm64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
-          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') { throw "This runner is not ARM64: $env:PROCESSOR_ARCHITECTURE" }
-          $flutterDir = Join-Path $env:RUNNER_TEMP 'flutter'
-          if (Test-Path $flutterDir) { Remove-Item -Recurse -Force $flutterDir }
-          git clone --depth 1 -b 3.44.9 https://github.com/flutter/flutter.git $flutterDir
-          git -C $flutterDir config --local safe.directory $flutterDir
-          "FLUTTER_ROOT=$flutterDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$flutterDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          "$flutterDir\bin\cache\dart-sdk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          & "$flutterDir\bin\flutter.bat" --version
-
       - name: Setup Flutter
-        if: matrix.name != 'windows-arm64'
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.38.7'
@@ -165,7 +121,7 @@ jobs:
         shell: bash
 
       - name: Build with build.sh (Android/macOS/iOS)
-        if: matrix.name != 'windows-amd64' && matrix.name != 'windows-arm64'
+        if: matrix.name != 'windows-amd64'
         continue-on-error: true
         run: |
           chmod +x build.sh
@@ -173,34 +129,18 @@ jobs:
         shell: bash
 
       - name: Build on Windows
-        if: matrix.name == 'windows-amd64' || matrix.name == 'windows-arm64'
+        if: matrix.name == 'windows-amd64'
         continue-on-error: true
         shell: pwsh
         run: |
           $version = "${{ steps.get_version.outputs.version }}"
-          $arch = "${{ matrix.arch }}"
-          Write-Host "Building version: $version ($arch)" -ForegroundColor Green
+          Write-Host "Building version: $version" -ForegroundColor Green
           flutter pub get
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Write-Host "Building Windows $arch..." -ForegroundColor Blue
+          Write-Host "Building Windows..." -ForegroundColor Blue
           flutter build windows --release
-          # Output path is architecture-dependent since Flutter 3.16:
-          #   x64   -> build/windows/x64/runner/Release/
-          #   arm64 -> build/windows/arm64/runner/Release/
-          $releaseDir = "build/windows/$arch/runner/Release"
-          if (-not (Test-Path $releaseDir)) { throw "Build output not found: $releaseDir" }
-          # Hard check: main exe PE machine must match the target arch,
-          # so an x64 binary can never be silently packaged as arm64.
-          #   x64 = 0x8664, arm64 = 0xAA64
-          $exe = Get-ChildItem $releaseDir -Filter *.exe | Sort-Object Length -Descending | Select-Object -First 1
-          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
-          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
-          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
-          $expected = if ($arch -eq 'arm64') { 0xAA64 } else { 0x8664 }
-          Write-Host ("{0} machine=0x{1:X4} expected=0x{2:X4}" -f $exe.Name, $machine, $expected)
-          if ($machine -ne $expected) { throw "Wrong architecture for $($exe.Name): got 0x$($machine.ToString('X4')), expected 0x$($expected.ToString('X4'))" }
-          Compress-Archive -Path "$releaseDir/*" -DestinationPath "dist/selene-$version-windows-$arch-portable.zip" -Force
-          Write-Host "Windows $arch build complete" -ForegroundColor Green
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "dist/selene-$version-windows-x64-portable.zip" -Force
+          Write-Host "Windows build complete" -ForegroundColor Green
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
