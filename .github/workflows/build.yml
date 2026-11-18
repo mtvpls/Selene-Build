@@ -28,10 +28,19 @@ jobs:
           - name: macos_ios
             os: macos-latest
             build-args: "--apple-only --sequential"
-            
-          # Windows
+
+          # Windows x64
           - name: windows-amd64
             os: windows-latest
+            arch: x64
+
+          # Windows ARM64 - must run on a native ARM runner.
+          # Flutter has no Windows cross-compilation: in 3.38.7
+          # `flutter build windows` targets the host architecture only
+          # (windows-x64 on an x64 host, windows-arm64 on an ARM64 host).
+          - name: windows-arm64
+            os: windows-11-arm
+            arch: arm64
 
     runs-on: ${{ matrix.os }}
     env:
@@ -48,7 +57,7 @@ jobs:
           repository: ${{ secrets.REPO_URL }}
           token: ${{ secrets.PULL_TOKEN }}
           fetch-depth: 1
-      
+
       - name: Get version from pubspec.yaml
         id: get_version
         run: |
@@ -61,10 +70,37 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
         shell: bash
-      
+
+      # Windows ARM64 only: do NOT use subosito/flutter-action here.
+      # Its Windows SDK archive for 3.38.7 is x64-only (dart_sdk_arch: x64 in
+      # releases_windows.json), so on an ARM runner it would install an
+      # emulated x64 Dart and `flutter build windows` would produce an x64
+      # binary instead of arm64. Cloning the 3.38.7 tag instead lets Flutter
+      # bootstrap the native arm64 Dart SDK / engine on first run
+      # (same approach PicGuard uses for its 3.38.x ARM64 builds).
+      # This is inlined because the checkout above replaces the workspace
+      # with the Selene repo (secrets.REPO_URL), so a script file committed
+      # to the workflow repo would not be present here.
+      - name: Install Flutter 3.38.7 (Windows ARM64)
+        if: matrix.name == 'windows-arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $flutterDir = Join-Path $env:RUNNER_TEMP 'flutter'
+          if (Test-Path $flutterDir) { Remove-Item -Recurse -Force $flutterDir }
+          git clone --depth 1 -b 3.38.7 https://github.com/flutter/flutter.git $flutterDir
+          git -C $flutterDir config --local safe.directory $flutterDir
+          "FLUTTER_ROOT=$flutterDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$flutterDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$flutterDir\bin\cache\dart-sdk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$flutterDir\bin\flutter.bat" --version
+
       - name: Setup Flutter
+        if: matrix.name != 'windows-arm64'
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.38.7'
+          channel: 'stable'
           cache: true
 
       - name: Install Java
@@ -98,7 +134,7 @@ jobs:
         run: |
           echo "y" | sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
           echo "y" | sdkmanager --install "ndk;${{ env.NDK_VERSION_DEPS }}"
-          
+
       - name: Write sign info
         if: matrix.name == 'android'
         run: |
@@ -119,27 +155,43 @@ jobs:
         shell: bash
 
       - name: Build with build.sh (Android/macOS/iOS)
-        if: matrix.name != 'windows-amd64'
+        if: matrix.name != 'windows-amd64' && matrix.name != 'windows-arm64'
         continue-on-error: true
         run: |
           chmod +x build.sh
           ./build.sh ${{ matrix.build-args }}
         shell: bash
-      
+
       - name: Build on Windows
-        if: matrix.name == 'windows-amd64'
+        if: matrix.name == 'windows-amd64' || matrix.name == 'windows-arm64'
         continue-on-error: true
         shell: pwsh
         run: |
           $version = "${{ steps.get_version.outputs.version }}"
-          Write-Host "Building version: $version" -ForegroundColor Green
+          $arch = "${{ matrix.arch }}"
+          Write-Host "Building version: $version ($arch)" -ForegroundColor Green
           flutter pub get
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Write-Host "Building Windows..." -ForegroundColor Blue
+          Write-Host "Building Windows $arch..." -ForegroundColor Blue
           flutter build windows --release
-          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "dist/selene-$version-windows-x64-portable.zip" -Force
-          Write-Host "Windows build complete" -ForegroundColor Green
-      
+          # Output path is architecture-dependent since Flutter 3.16:
+          #   x64   -> build/windows/x64/runner/Release/
+          #   arm64 -> build/windows/arm64/runner/Release/
+          $releaseDir = "build/windows/$arch/runner/Release"
+          if (-not (Test-Path $releaseDir)) { throw "Build output not found: $releaseDir" }
+          # Hard check: main exe PE machine must match the target arch,
+          # so an x64 binary can never be silently packaged as arm64.
+          #   x64 = 0x8664, arm64 = 0xAA64
+          $exe = Get-ChildItem $releaseDir -Filter *.exe | Sort-Object Length -Descending | Select-Object -First 1
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expected = if ($arch -eq 'arm64') { 0xAA64 } else { 0x8664 }
+          Write-Host ("{0} machine=0x{1:X4} expected=0x{2:X4}" -f $exe.Name, $machine, $expected)
+          if ($machine -ne $expected) { throw "Wrong architecture for $($exe.Name): got 0x$($machine.ToString('X4')), expected 0x$($expected.ToString('X4'))" }
+          Compress-Archive -Path "$releaseDir/*" -DestinationPath "dist/selene-$version-windows-$arch-portable.zip" -Force
+          Write-Host "Windows $arch build complete" -ForegroundColor Green
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         continue-on-error: true
@@ -156,25 +208,25 @@ jobs:
       TZ: Asia/Shanghai
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: all-artifacts
-      
+
       - name: Prepare release artifacts
         run: |
           mkdir -p release-files
           find all-artifacts -type f -exec cp {} release-files/ \;
           ls -lh release-files/
-      
+
       - name: Get version from tag
         id: tag_version
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Release version: $VERSION"
-      
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -186,23 +238,23 @@ jobs:
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Get Release Notes
         id: release_notes
         run: |
           RELEASE_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.tag_version.outputs.version }}")
-          
+
           RELEASE_BODY=$(echo "$RELEASE_INFO" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('body', '') if 'body' in data else '')")
-          
+
           {
             echo 'notes<<EOF'
             echo "$RELEASE_BODY"
             echo EOF
           } >> $GITHUB_OUTPUT
-          
+
           echo "Release notes length: ${#RELEASE_BODY}"
-      
+
       - name: Send Telegram notification
         if: success()
         env:
@@ -213,74 +265,74 @@ jobs:
             echo "No release files found"
             exit 0
           fi
-          
+
           VERSION="${{ steps.tag_version.outputs.version }}"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${VERSION}"
           TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-          
+
           RELEASE_NOTES=$(cat << 'NOTES_EOF'
           ${{ steps.release_notes.outputs.notes }}
           NOTES_EOF
           )
-          
+
           echo "开始上传文件到 Telegram..."
-          
+
           FILE_IDS=()
           MESSAGE_IDS=()
           for file in release-files/*; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
-              
+
               if [[ ! "$filename" =~ \.(apk|ipa)$ ]]; then
                 echo "跳过文件: $filename"
                 continue
               fi
-              
+
               RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
                 -F "chat_id=${CHANNEL_ID}" \
                 -F "document=@${file}")
-              
+
               FILE_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['result']['document']['file_id'] if 'result' in data else '')" 2>/dev/null)
               MESSAGE_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['result']['message_id'] if 'result' in data else '')" 2>/dev/null)
-              
+
               if [ ! -z "$FILE_ID" ]; then
                 FILE_IDS+=("$FILE_ID")
                 MESSAGE_IDS+=("$MESSAGE_ID")
               fi
-              
+
               sleep 1
             fi
           done
-          
+
           if [ ${#FILE_IDS[@]} -gt 0 ]; then
             echo "准备发送 media group..."
-            FILE_IDS_JSON=$(printf '%s\n' "${FILE_IDS[@]}" | jq -R . | jq -s .) 
+            FILE_IDS_JSON=$(printf '%s\n' "${FILE_IDS[@]}" | jq -R . | jq -s .)
             export FILE_IDS_JSON VERSION RELEASE_URL TIMESTAMP RELEASE_NOTES
-            
+
             python3 << 'PYEOF' > media.json
           import json
           import os
-          
+
           file_ids = json.loads(os.environ['FILE_IDS_JSON'])
           version = os.environ['VERSION']
           release_url = os.environ['RELEASE_URL']
           timestamp = os.environ['TIMESTAMP']
           release_notes = os.environ.get('RELEASE_NOTES', '').strip()
-          
+
           message = f"""🎉 *Selene 新版本发布*"""
-          
+
           if release_notes:
               if len(release_notes) > 800:
                   release_notes = release_notes[:800] + "..."
               message += f"\n\n📝 *更新说明*: \n{release_notes}"
-          
+
           message += f"""
-          
+
           📦 版本: `{version}`
           🔗 GitHub: [点击查看]({release_url})
           💡 Windows 及 MacOS 包请自行前往 Releases 处下载
           🕐 发布于: {timestamp}"""
-          
+
           media = []
           for idx, file_id in enumerate(file_ids):
               item = {
@@ -291,21 +343,21 @@ jobs:
                   item["caption"] = message
                   item["parse_mode"] = "Markdown"
               media.append(item)
-          
+
           print(json.dumps(media))
           PYEOF
-            
+
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup" \
               -H "Content-Type: application/json" \
               -d "{\"chat_id\":\"${CHANNEL_ID}\",\"media\":$(cat media.json)}"
-            
+
             for msg_id in "${MESSAGE_IDS[@]}"; do
               curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" \
                 -d "chat_id=${CHANNEL_ID}" \
                 -d "message_id=${msg_id}" > /dev/null
             done
           fi
-        
+
   cleanup:
     runs-on: ubuntu-latest
     needs: build
